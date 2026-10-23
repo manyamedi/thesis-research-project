@@ -1,0 +1,1072 @@
+---
+title: "Research project final code"
+author: "Manya Mediratta"
+date: "2026-10-22"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(survey)
+library(WeMix)
+library(labelled)
+library(sf)
+library(Rrepest)
+
+teacher_path <- "~/Desktop/TALIS/ttgintt4.rds"
+principal_path <- "~/Desktop/TALIS/tcgintt4.rds"
+
+teacher_data <- readRDS(path.expand(teacher_path))
+principal_data <- readRDS(path.expand(principal_path))
+```
+
+```{r}
+# 2. SCHOOL-LEVEL VARIABLES
+
+schools <- principal_data %>%
+  filter(IDPOP == 2) %>%
+  transmute(
+
+    CNTRY,
+    IDSCHOOL,
+
+    # TC4G28A: # question askes is supporting the integration of digital resources and tools for teaching
+    # 1 = Never or rarely
+    # 2 = Sometimes
+    # 3 = Often
+    # 4 = Very often
+    digital_leadership = case_when(
+      TC4G28A %in% 1:4 ~ as.numeric(TC4G28A),
+      TRUE ~ NA_real_
+    ),
+
+    # TC4G40E = shortage/inadequacy of digital technology
+    # TC4G40F = insufficient internet access
+    # Higher score = greater shortage
+    digital_shortage = rowMeans(
+      cbind(
+        as.numeric(TC4G40E),
+        as.numeric(TC4G40F)
+      ),
+      na.rm = FALSE
+    ),
+
+    # Principal MGCFA scales
+    instructional_leadership = as.numeric(T4PLEADS),
+    staff_participation = as.numeric(T4POPPART)
+  )
+```
+
+```{r}
+# 3. MAIN ANALYSIS SAMPLE
+
+q20_vars <- paste0("TT4G20", LETTERS[1:10]) #This looks at question 20, its coding is explained in the papers methodology
+
+teachers_bc <- teacher_data %>%
+  filter(
+    IDPOP == 2,
+    IDTQUEST %in% c(2, 3)
+  ) %>%
+  mutate(
+    # Outcome: Question 21, item G
+    no_pl_confirmed = if_all(
+      all_of(q20_vars),
+      ~ !is.na(.x) & as.numeric(.x) == 4
+    ),
+
+    ai_pl_from_routing =
+      is.na(TT4G21G) & no_pl_confirmed,
+
+    ai_pl_access = case_when(
+      as.numeric(TT4G21G) == 1 ~ 1,
+      as.numeric(TT4G21G) == 2 ~ 0,
+      ai_pl_from_routing ~ 0,
+      TRUE ~ NA_real_
+    ),
+
+    # Declared need for AI-related professional learning
+    ai_need = factor(
+      as.numeric(TT4G24G),
+      levels = 1:4,
+      labels = c(
+        "No need",
+        "Low need",
+        "Moderate need",
+        "High need"
+      )
+    ),
+
+    # Create simple dummy variables; reference group is "No need"
+    need_low = as.integer(ai_need == "Low need"),
+    need_moderate = as.integer(ai_need == "Moderate need"),
+    need_high = as.integer(ai_need == "High need"),
+
+    # TALIS MGCFA scales
+    digital_self_efficacy = as.numeric(T4SEDRT),
+    information_exchange = as.numeric(T4EXINF),
+    professional_collaboration = as.numeric(T4COLES),
+
+    # Well-being/stress scales
+    workplace_wellbeing = as.numeric(T4WELS),
+    workload_stress = as.numeric(T4WLOADT),
+    student_behaviour_stress = as.numeric(T4STBEH),
+
+    # Teacher experience category supplied by TALIS
+    teaching_experience = as.numeric(T4TYEXPTT)
+  )
+```
+
+```{r}
+# Merge principal data and centre continuous predictors
+
+main_data <- teachers_bc %>%
+  inner_join(
+    schools,
+    by = c("CNTRY", "IDSCHOOL")
+  ) %>%
+  mutate(
+
+    # Unique identifiers
+    school_id = paste(CNTRY, IDSCHOOL, sep = "_"),
+    country_id = CNTRY,
+
+    # WeMix weights following the TALIS User Guide
+    w_level1 = TCHWGT / SCHWGTT, #This divides the final teacher weight (TCHWGT) by the school weight used got # calculating the within school teacher weight
+    w_level2 = SCHWGTT,
+# These weights are calculated as advised by the OECD TALIS data guide 
+)
+```
+
+```{r}
+# 4. SAMPLE CONSTRUCTION
+
+# Step 1:
+# ISCED 2 teachers in questionnaire Forms B and C.
+# These forms contain both AI-related professional learning and digital self-efficacy variables.
+
+sample_1 <- main_data
+
+main_sample_log <- data.frame(
+  step = "1. ISCED 2 teachers in Forms B/C",
+  teachers = nrow(sample_1)
+)
+
+
+# Step 2:
+# Keep teachers with a valid answer to TT4G21G: reported participation in AI-related professional learning.
+
+sample_2 <- sample_1[
+  !is.na(sample_1$ai_pl_access),
+]
+
+main_sample_log <- rbind(
+  main_sample_log,
+  data.frame(
+    step = "2. Valid AI professional-learning participation",
+    teachers = nrow(sample_2)
+  )
+)
+
+
+# Step 3:
+# Keep teachers with valid AI professional-learning need: TT4G24G.
+
+sample_3 <- sample_2[
+  !is.na(sample_2$ai_need),
+]
+
+main_sample_log <- rbind(
+  main_sample_log,
+  data.frame(
+    step = "3. Valid AI professional-learning need",
+    teachers = nrow(sample_3)
+  )
+)
+
+
+# Step 4:
+# Keep teachers with valid teacher-level predictor variables:
+# - digital self-efficacy
+# - information exchange
+# - professional collaboration
+# - teaching experience
+
+sample_4 <- sample_3[
+  complete.cases(
+    sample_3$digital_self_efficacy,
+    sample_3$information_exchange,
+    sample_3$professional_collaboration,
+    sample_3$teaching_experience
+  ),
+]
+
+main_sample_log <- rbind(
+  main_sample_log,
+  data.frame(
+    step = "4. Valid digital self-efficacy, collaboration and experience",
+    teachers = nrow(sample_4)
+  )
+)
+
+
+# Step 5:
+# Keep teachers with valid principal-reported school variables,
+# valid multilevel weights, and a school identifier.
+
+sample_5 <- sample_4[
+  complete.cases(
+    sample_4$digital_leadership,
+    sample_4$digital_shortage,
+    sample_4$instructional_leadership,
+    sample_4$staff_participation,
+    sample_4$TCHWGT,
+    sample_4$SCHWGTT,
+    sample_4$CNTRY,
+    sample_4$IDSCHOOL
+  ),
+]
+
+# Exclude invalid or zero weights.
+sample_5 <- sample_5[
+  sample_5$TCHWGT > 0 &
+  sample_5$SCHWGTT > 0,
+]
+
+main_sample_log <- rbind(
+  main_sample_log,
+  data.frame(
+    step = "5. Valid school predictors, weights and IDs",
+    teachers = nrow(sample_5)
+  )
+)
+
+
+# Final model dataset:
+# This is the dataset that should be used for M0, M1, M2 and M3.
+
+main_model_data <- sample_5
+
+# Print the sample construction table
+print(main_sample_log)
+
+```
+
+```{r}
+# Centre continuous predictors in the final analytical sample
+main_model_data <- main_model_data %>%
+  ungroup() %>%
+  mutate(
+    selfeff_c = digital_self_efficacy -
+      mean(digital_self_efficacy, na.rm = TRUE),
+
+    exchange_c = information_exchange -
+      mean(information_exchange, na.rm = TRUE),
+
+    collaboration_c = professional_collaboration -
+      mean(professional_collaboration, na.rm = TRUE),
+
+    leadership_c = digital_leadership -
+      mean(digital_leadership, na.rm = TRUE),
+
+    shortage_c = digital_shortage -
+      mean(digital_shortage, na.rm = TRUE),
+
+    instr_lead_c = instructional_leadership -
+      mean(instructional_leadership, na.rm = TRUE),
+
+    staff_part_c = staff_participation -
+      mean(staff_participation, na.rm = TRUE)
+  ) %>%
+  mutate(
+    selfeff_x_leadership = selfeff_c * leadership_c,
+    selfeff_x_shortage = selfeff_c * shortage_c,
+    selfeff_x_high_need = selfeff_c * need_high
+  )
+
+centred_variables <- c(
+  "selfeff_c",
+  "exchange_c",
+  "collaboration_c",
+  "leadership_c",
+  "shortage_c",
+  "instr_lead_c",
+  "staff_part_c"
+)
+
+colMeans(
+  main_model_data[, centred_variables],
+  na.rm = TRUE
+)
+```
+
+```{r}
+# 4.1 TEACHING-EXPERIENCE VARIABLES
+# teaching_experience comes from TALIS variable T4TYEXPTT:
+# 1 = Five years or less
+# 2 = 6–10 years
+# 3 = 11–20 years
+# 4 = More than 20 years
+# Teachers with five years or less are the reference group.
+
+
+
+# First create a readable experience-group variable.
+
+main_model_data$experience_group <- NA_character_
+
+main_model_data$experience_group[
+  main_model_data$teaching_experience == 1
+] <- "0_5_years"
+
+main_model_data$experience_group[
+  main_model_data$teaching_experience == 2
+] <- "6_10_years"
+
+main_model_data$experience_group[
+  main_model_data$teaching_experience == 3
+] <- "11_20_years"
+
+main_model_data$experience_group[
+  main_model_data$teaching_experience == 4
+] <- "20plus_years"
+
+
+# Turn the text labels into an ordered category variable.
+
+main_model_data$experience_group <- factor(
+  main_model_data$experience_group,
+  levels = c(
+    "0_5_years",
+    "6_10_years",
+    "11_20_years",
+    "20plus_years"
+  )
+)
+
+
+# Create the three variables used in the regression.
+#
+# For the reference group, 0–5 years:
+# experience_6_10 = 0
+# experience_11_20 = 0
+# experience_20plus = 0
+
+main_model_data$experience_6_10 <- ifelse(
+  main_model_data$experience_group == "6_10_years",
+  1,
+  0
+)
+
+main_model_data$experience_11_20 <- ifelse(
+  main_model_data$experience_group == "11_20_years",
+  1,
+  0
+)
+
+main_model_data$experience_20plus <- ifelse(
+  main_model_data$experience_group == "20plus_years",
+  1,
+  0
+)
+
+
+# Check the experience distribution.
+
+table(
+  main_model_data$experience_group,
+  useNA = "ifany"
+)
+
+table(
+  main_model_data$teaching_experience,
+  main_model_data$experience_group,
+  useNA = "ifany"
+)
+```
+
+```{r}
+# 5. DESCRIPTIVE STATISTICS: MAIN SAMPLE
+
+# Variables used in the descriptive tables
+continuous_vars <- c(
+  "digital_self_efficacy",
+  "information_exchange",
+  "professional_collaboration",
+  "digital_leadership",
+  "digital_shortage",
+  "instructional_leadership",
+  "staff_participation"
+)
+
+variable_labels <- c(
+  "Digital self-efficacy",
+  "Information exchange",
+  "Professional collaboration",
+  "Digital leadership",
+  "Digital resource shortage",
+  "Instructional leadership",
+  "Staff participation in school decisions"
+)
+
+
+# Check the data: these summaries and counts are unweighted
+summary(main_model_data[, c("ai_pl_access", continuous_vars)])
+
+table(main_model_data$ai_pl_access, useNA = "ifany")
+table(main_model_data$ai_need, useNA = "ifany")
+table(main_model_data$teaching_experience, useNA = "ifany")
+table(main_model_data$digital_leadership, useNA = "ifany")
+
+
+# Calculate descriptive statistics for each continuous variable
+descriptive_stats <- data.frame()
+
+for (i in seq_along(continuous_vars)) {
+
+  x <- as.numeric(main_model_data[[continuous_vars[i]]])
+  w <- as.numeric(main_model_data$TCHWGT)
+
+  # Use the same valid observations for both sets of statistics
+  keep <- is.finite(x) & is.finite(w) & w > 0
+  x <- x[keep]
+  w <- w[keep]
+
+  weighted_mean <- weighted.mean(x, w)
+  weighted_sd <- sqrt(sum(w * (x - weighted_mean)^2) / sum(w))
+
+  descriptive_stats <- rbind(
+    descriptive_stats,
+    data.frame(
+      variable = continuous_vars[i],
+      label = variable_labels[i],
+      unweighted_N = length(x),
+      unweighted_mean = mean(x),
+      unweighted_SD = sd(x),
+      weighted_mean = weighted_mean,
+      weighted_SD = weighted_sd,
+      observed_min = min(x),
+      observed_max = max(x)
+    )
+  )
+}
+
+
+# Weighted descriptive table for the main text
+weighted_descriptives <- descriptive_stats[, c(
+  "label",
+  "unweighted_N",
+  "weighted_mean",
+  "weighted_SD",
+  "observed_min",
+  "observed_max"
+)]
+
+weighted_descriptives
+
+
+# Weighted and unweighted comparison table
+comparison_table <- descriptive_stats[, c(
+  "label",
+  "unweighted_N",
+  "unweighted_mean",
+  "unweighted_SD",
+  "weighted_mean",
+  "weighted_SD"
+)]
+
+comparison_table
+
+# Print the comparison table as LaTeX
+cat(knitr::kable(
+  comparison_table,
+  format = "latex",
+  digits = 2,
+  row.names = FALSE,
+  col.names = c(
+    "Variable",
+    "N",
+    "Unweighted mean",
+    "Unweighted SD",
+    "Weighted mean",
+    "Weighted SD"
+  ),
+  caption = "Weighted and Unweighted Descriptive Statistics",
+  label = "descriptive_comparison"
+))
+
+
+# Overall weighted participation rate
+overall_participation <- with(
+  main_model_data,
+  weighted.mean(ai_pl_access, TCHWGT, na.rm = TRUE) * 100
+)
+
+overall_participation
+
+
+# Weighted participation within each reported-need category
+participation_by_need <- main_model_data %>%
+  group_by(ai_need) %>%
+  summarise(
+    teachers = n(),
+    weighted_participation = weighted.mean(
+      ai_pl_access,
+      TCHWGT,
+      na.rm = TRUE
+    ) * 100,
+    .groups = "drop"
+  )
+
+participation_by_need
+
+
+# Chart using the same results as the table above
+barplot(
+  participation_by_need$weighted_participation,
+  names.arg = participation_by_need$ai_need,
+  main = "AI-related professional-learning participation",
+  ylab = "Participation within need category (%)",
+  ylim = c(0, 100),
+  las = 2,
+  cex.names = 0.9,
+  col = "darkgreen",
+  border = NA
+)
+
+
+# Weighted participation by education system
+country_participation <- main_model_data %>%
+  group_by(CNTRY) %>%
+  summarise(
+    teachers = n(),
+    weighted_participation = weighted.mean(
+      ai_pl_access,
+      TCHWGT,
+      na.rm = TRUE
+    ) * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(weighted_participation))
+
+country_participation
+```
+
+```{r}
+# 6. WEMIX MODELS:
+# AI PROFESSIONAL-LEARNING PARTICIPATION AS OUTCOME
+
+# M0: Null model
+m0 <- mix(
+  ai_pl_access ~ 1 + (1 | school_id),
+  data = main_model_data,
+  weights = c("w_level1", "w_level2"),
+  cWeights = TRUE
+)
+
+summary(m0)
+
+m0_results <- data.frame(
+  term = names(m0$coef),
+  estimate = as.numeric(m0$coef),
+  SE = as.numeric(m0$SE)
+)
+
+write.csv(
+  m0_results,
+  "M0_results.csv",
+  row.names = FALSE
+)
+
+```
+
+```{r}
+# M1: Teacher-level model
+# Is digital self-efficacy associated with AI professional-learning participation?
+
+m1 <- mix(
+  ai_pl_access ~
+    selfeff_c +
+    need_low +
+    need_moderate +
+    need_high +
+    exchange_c +
+    collaboration_c +
+    experience_6_10 +
+    experience_11_20 +
+    experience_20plus +
+    (1 | school_id),
+
+  data = main_model_data,
+  weights = c("w_level1", "w_level2"),
+  cWeights = TRUE
+)
+
+summary(m1)
+
+m1_results <- data.frame(
+  term = names(m1$coef),
+  estimate = as.numeric(m1$coef),
+  SE = as.numeric(m1$SE)
+)
+
+write.csv(
+  m1_results,
+  "M1_results.csv",
+  row.names = FALSE
+)
+```
+
+```{r}
+# M2: Add school conditions
+
+# Keep only the variables required for M2 to reduce computational load
+m2_data <- main_model_data[, c(
+  "ai_pl_access",
+  "selfeff_c",
+  "need_low",
+  "need_moderate",
+  "need_high",
+  "exchange_c",
+  "collaboration_c",
+  "experience_6_10",
+  "experience_11_20",
+  "experience_20plus",
+  "leadership_c",
+  "shortage_c",
+  "instr_lead_c",
+  "staff_part_c",
+  "school_id",
+  "w_level1",
+  "w_level2"
+)]
+
+# Drop unused factor levels from school ID
+m2_data$school_id <- droplevels(
+  factor(m2_data$school_id)
+)
+
+m2 <- mix(
+  ai_pl_access ~
+    selfeff_c +
+    need_low +
+    need_moderate +
+    need_high +
+    exchange_c +
+    collaboration_c +
+    experience_6_10 +
+    experience_11_20 +
+    experience_20plus +
+    leadership_c +
+    shortage_c +
+    instr_lead_c +
+    staff_part_c +
+    (1 | school_id),
+
+  data = m2_data,
+  weights = c("w_level1", "w_level2"),
+  cWeights = TRUE
+)
+
+summary(m2)
+
+m2_results <- data.frame(
+  term = names(m2$coef),
+  estimate = as.numeric(m2$coef),
+  SE = as.numeric(m2$SE)
+)
+
+write.csv(
+  m2_results,
+  "M2_results.csv",
+  row.names = FALSE
+)
+
+```
+
+```{r}
+# M3: Test moderation
+# selfeff_c : leadership_c
+# Does digital leadership change the self-efficacy association?
+# selfeff_c : shortage_c
+# Does resource shortage change the self-efficacy association?
+# selfeff_c : need_high
+# Does the self-efficacy association differ for teachers reporting high need compared with the common association specified for the other need categories?
+
+m3 <- mix(
+  ai_pl_access ~
+    selfeff_c +
+    need_low +
+    need_moderate +
+    need_high +
+    exchange_c +
+    collaboration_c +
+    experience_6_10 +
+    experience_11_20 +
+    experience_20plus +
+    leadership_c +
+    shortage_c +
+    instr_lead_c +
+    staff_part_c +
+    selfeff_x_leadership +
+    selfeff_x_shortage +
+    selfeff_x_high_need +
+    (1 | school_id),
+
+  data = main_model_data,
+  weights = c("w_level1", "w_level2"),
+  cWeights = TRUE
+)
+
+summary(m3)
+
+m3_results <- data.frame(
+  term = names(m3$coef),
+  estimate = as.numeric(m3$coef),
+  SE = as.numeric(m3$SE)
+)
+
+write.csv(
+  m3_results,
+  "m3_results.csv",
+  row.names = FALSE
+)
+```
+
+```{r}
+library(ggplot2)
+
+interaction_data <- data.frame(
+  label = factor(
+    c(
+      "Self-efficacy x high need",
+      "Self-efficacy x shortage",
+      "Self-efficacy x leadership"
+    ),
+    levels = c(
+      "Self-efficacy x high need",
+      "Self-efficacy x shortage",
+      "Self-efficacy x leadership"
+    )
+  ),
+  estimate_pp = 100 * c(
+    -0.000252,
+    0.000373,
+    -0.000940
+  ),
+  lower_pp = 100 * c(
+    -0.000252 - 1.96 * 0.004249,
+    0.000373 - 1.96 * 0.002729,
+    -0.000940 - 1.96 * 0.003181
+  ),
+  upper_pp = 100 * c(
+    -0.000252 + 1.96 * 0.004249,
+    0.000373 + 1.96 * 0.002729,
+    -0.000940 + 1.96 * 0.003181
+  )
+)
+
+interaction_plot <- ggplot(
+  interaction_data,
+  aes(y = label, x = estimate_pp)
+) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    colour = "grey50"
+  ) +
+  geom_segment(
+    aes(x = lower_pp, xend = upper_pp, yend = label),
+    linewidth = 0.7
+  ) +
+  geom_point(size = 2.6) +
+  labs(
+    x = "Interaction coefficient (percentage-point units)",
+    y = NULL,
+    title = "Self-efficacy interactions in Model M3",
+    caption = paste(
+      "Points: estimates. Lines: normal-approximation 95% confidence intervals.",
+      "Each interaction is interpreted in the units of its moderator.",
+      sep = "\n"
+    )
+  ) +
+  theme_minimal(base_size = 11)
+
+interaction_plot
+
+ggsave(
+  "M3_interactions.pdf",
+  plot = interaction_plot,
+  width = 7,
+  height = 3.8
+)
+```
+
+
+```{r}
+m1_results <- read.csv("M1_results.csv")
+m2_results <- read.csv("M2_results.csv")
+m3_results <- read.csv("M3_results.csv")
+
+# Format each model's estimates and standard errors
+m1_table <- data.frame(
+  term = m1_results$term,
+  M1 = sprintf(
+    "%.4f (%.4f)",
+    m1_results$estimate,
+    m1_results$SE
+  )
+)
+
+m2_table <- data.frame(
+  term = m2_results$term,
+  M2 = sprintf(
+    "%.4f (%.4f)",
+    m2_results$estimate,
+    m2_results$SE
+  )
+)
+
+m3_table <- data.frame(
+  term = m3_results$term,
+  M3 = sprintf(
+    "%.4f (%.4f)",
+    m3_results$estimate,
+    m3_results$SE
+  )
+)
+
+# Match rows by coefficient name
+results_table <- merge(
+  m1_table, m2_table,
+  by = "term", all = TRUE, sort = FALSE
+)
+
+results_table <- merge(
+  results_table, m3_table,
+  by = "term", all = TRUE, sort = FALSE
+)
+
+# Keep the ordering used in M3
+results_table <- results_table[
+  match(m3_results$term, results_table$term),
+]
+
+# Blank cells mean the variable was not included
+results_table[is.na(results_table)] <- ""
+
+knitr::kable(
+  results_table,
+  format = "pipe",
+  row.names = FALSE,
+  col.names = c("Predictor", "M1", "M2", "M3"),
+  caption = "Weighted Multilevel Linear Probability Models"
+)
+```
+
+
+```{r}
+# ROBUSTNESS CHECKS
+# Keep the exact formula you already used.
+m3_formula <- formula(m3$call$formula)
+
+# Save the existing output.
+capture.output(
+  summary(m3),
+  file = "robustness_results/M3_original_summary.txt"
+)
+# Add education-system fixed effects
+country_formula <- update(
+  m3_formula,
+  . ~ . + factor(CNTRY)
+)
+
+m3_country <- WeMix::mix(
+  country_formula,
+  data = main_model_data,
+  weights = c("w_level1", "w_level2"),
+  cWeights = TRUE
+)
+
+summary(m3_country)
+
+m3_country_results <- data.frame(term = names(m3_country$coef),
+  estimate = as.numeric(m3_country$coef),
+  SE = as.numeric(m3_country$SE)
+)
+write.csv(
+  m3_country_results,
+  "m3_country_results.csv",
+  row.names = FALSE
+)
+```
+
+```{r}
+# 1. Create a new scaled teacher weight.
+
+main_model_data <- main_model_data %>%
+  group_by(school_id) %>%
+  mutate(
+    w_level1_scaled = w_level1 * n() / sum(w_level1)
+  ) %>%
+  ungroup()
+
+# 2. Fit the same M3 using the scaled teacher weight.
+m3_scaled <- mix(
+  m3_formula,
+  data = main_model_data,
+  weights = c("w_level1_scaled", "w_level2"),
+  cWeights = TRUE
+)
+
+summary(m3_scaled)
+
+# 3. Keep the scaled-model coefficients and standard errors.
+scaled_results <- data.frame(
+  term = names(m3_scaled$coef),
+  estimate = as.numeric(m3_scaled$coef),
+  SE = as.numeric(m3_scaled$SE)
+)
+
+# 4. Compare the three interactions with your original M3.
+# m3_results is the original coefficient table saved earlier.
+interaction_terms <- c(
+  "selfeff_x_leadership",
+  "selfeff_x_shortage",
+  "selfeff_x_high_need"
+)
+
+comparison <- merge(
+  m3_results,
+  scaled_results,
+  by = "term",
+  suffixes = c("_original", "_scaled")
+)
+
+comparison[
+  comparison$term %in% interaction_terms,
+]
+
+m3_scaled_results <- data.frame(term = names(m3_scaled$coef),
+  estimate = as.numeric(m3_scaled$coef),
+  SE = as.numeric(m3_scaled$SE)
+)
+write.csv(
+  m3_scaled_results,
+  "m3_scaled_results.csv",
+  row.names = FALSE
+)
+```
+
+```{r}
+main_good_samples <- main_model_data[
+  main_model_data$ADJRT24 >= 2, #This is an index constructed by the OECD to evaluate the quality of data collected from countries
+]
+
+m3_good_samples <- mix(
+  ai_pl_access ~
+    selfeff_c +
+    need_low +
+    need_moderate +
+    need_high +
+    exchange_c +
+    collaboration_c +
+    experience_6_10 +
+    experience_11_20 +
+    experience_20plus +
+    leadership_c +
+    shortage_c +
+    instr_lead_c +
+    staff_part_c +
+    selfeff_x_leadership +
+    selfeff_x_shortage +
+    selfeff_x_high_need +
+    (1 | school_id),
+
+  data = main_good_samples,
+  weights = c("w_level1", "w_level2"),
+  cWeights = TRUE
+)
+
+summary(m3_good_samples)
+```
+
+```{r}
+main_unweighted <- lm(
+  ai_pl_access ~
+    selfeff_c +
+    need_low +
+    need_moderate +
+    need_high +
+    exchange_c +
+    collaboration_c +
+    experience_6_10 +
+    experience_11_20 +
+    experience_20plus +
+    leadership_c +
+    shortage_c +
+    instr_lead_c +
+    staff_part_c,
+
+  data = main_model_data
+)
+
+summary(main_unweighted)
+```
+
+```{r}
+main_lm_check <- lm(
+  ai_pl_access ~
+    selfeff_c +
+    need_low +
+    need_moderate +
+    need_high +
+    exchange_c +
+    collaboration_c +
+    experience_6_10 +
+    experience_11_20 +
+    experience_20plus +
+    leadership_c +
+    shortage_c +
+    instr_lead_c +
+    staff_part_c,
+
+  data = main_model_data
+)
+
+predicted_values <- predict(main_lm_check)
+
+summary(predicted_values)
+
+sum(predicted_values < 0)
+
+sum(predicted_values > 1)
+
+mean(predicted_values < 0 | predicted_values > 1) * 100
+```
+
+```{r}
+main_logit <- glm(
+  ai_pl_access ~
+    selfeff_c +
+    need_low +
+    need_moderate +
+    need_high +
+    exchange_c +
+    collaboration_c +
+    experience_6_10 +
+    experience_11_20 +
+    experience_20plus +
+    leadership_c +
+    shortage_c +
+    instr_lead_c +
+    staff_part_c,
+
+  family = binomial(),
+  data = main_model_data
+)
+
+summary(main_logit)
+```
+
+

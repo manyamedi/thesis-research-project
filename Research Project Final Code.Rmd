@@ -1006,7 +1006,10 @@ main_unweighted <- lm(
     leadership_c +
     shortage_c +
     instr_lead_c +
-    staff_part_c,
+    staff_part_c+
+    selfeff_x_leadership +
+    selfeff_x_shortage +
+    selfeff_x_high_need,
 
   data = main_model_data
 )
@@ -1029,7 +1032,10 @@ main_lm_check <- lm(
     leadership_c +
     shortage_c +
     instr_lead_c +
-    staff_part_c,
+    staff_part_c+
+    selfeff_x_leadership +
+    selfeff_x_shortage +
+    selfeff_x_high_need,
 
   data = main_model_data
 )
@@ -1060,7 +1066,10 @@ main_logit <- glm(
     leadership_c +
     shortage_c +
     instr_lead_c +
-    staff_part_c,
+    staff_part_c+
+    selfeff_x_leadership +
+    selfeff_x_shortage +
+    selfeff_x_high_need,
 
   family = binomial(),
   data = main_model_data
